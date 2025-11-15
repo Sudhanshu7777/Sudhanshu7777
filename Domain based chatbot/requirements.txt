@@ -1,4 +1,13 @@
 Flask
+Flask-PyMongo
+Flask-Bcrypt
+Flask-CORS
 pymongo
 python-dotenv
 google-generativeai
+tensorflow
+tflite-runtime
+numpy
+Pillow
+opencv-python-headless
+requests

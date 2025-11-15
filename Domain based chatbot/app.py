@@ -5,11 +5,16 @@ import google.generativeai as genai
 import os
 from dotenv import load_dotenv
 from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
 from datetime import datetime, timedelta
 from flask_bcrypt import Bcrypt
 from bson.objectid import ObjectId
 import logging
 from functools import wraps
+from pathlib import Path
+
+from ml import WasteClassifier, InvalidImageError, LowConfidenceError, ModelNotReadyError
+from ml.waste_classifier import CONFIDENCE_THRESHOLD
 
 # Load environment variables
 load_dotenv()
@@ -51,6 +56,11 @@ try:
 except Exception as model_error:
     logger.error(f"Model Initialization Error: {model_error}")
     raise RuntimeError("Failed to initialize Gemini AI model.")
+
+waste_classifier = WasteClassifier()
+logger.info(f"Waste classifier initialized (mock mode: {waste_classifier.uses_mock})")
+
+
 @app.after_request
 def after_request(response):
     # Add necessary headers for CORS and session
@@ -59,6 +69,8 @@ def after_request(response):
     response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
     response.headers.add('Access-Control-Allow-Credentials', 'true')
     return response
+
+
 # Login required decorator
 def login_required(f):
     @wraps(f)
@@ -335,6 +347,118 @@ def get_profile():
     except Exception as e:
         logger.error(f"Profile error: {e}")
         return jsonify({"error": "Failed to fetch profile"}), 500
+
+ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+MAX_FILE_SIZE = 10 * 1024 * 1024
+
+def validate_uploaded_file(file):
+    """Validate uploaded image file."""
+    if not file:
+        raise ValueError("No file uploaded")
+    
+    if not file.filename:
+        raise ValueError("Empty filename")
+    
+    file_ext = Path(file.filename).suffix.lower()
+    if file_ext not in ALLOWED_IMAGE_EXTENSIONS:
+        raise ValueError(
+            f"Invalid file format: {file_ext}. Allowed: {', '.join(sorted(ALLOWED_IMAGE_EXTENSIONS))}"
+        )
+    
+    file.seek(0, 2)
+    file_size = file.tell()
+    file.seek(0)
+    
+    if file_size == 0:
+        raise ValueError("Empty file")
+    
+    if file_size > MAX_FILE_SIZE:
+        raise ValueError(f"File too large: {file_size / (1024*1024):.2f}MB (max: 10MB)")
+
+@app.route("/api/classify", methods=["POST"])
+def classify_waste():
+    """Classify waste from uploaded image."""
+    try:
+        if "image" not in request.files:
+            return jsonify({"error": "No image file provided in request"}), 400
+        
+        file = request.files["image"]
+        
+        try:
+            validate_uploaded_file(file)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        
+        filename = secure_filename(file.filename)
+        image_bytes = file.read()
+        
+        try:
+            result = waste_classifier.classify(image_bytes, filename=filename)
+            return jsonify(result), 200
+        
+        except InvalidImageError as e:
+            logger.warning(f"Invalid image: {e}")
+            return jsonify({"error": f"Invalid image: {str(e)}"}), 400
+        
+        except LowConfidenceError as e:
+            logger.info(f"Low confidence prediction: {e}")
+            return jsonify({
+                "error": "Low confidence prediction",
+                "message": str(e),
+                "confidence": getattr(e, "confidence", None),
+                "threshold": CONFIDENCE_THRESHOLD,
+                "suggestion": "Try uploading a clearer image with better lighting"
+            }), 422
+        
+        except ModelNotReadyError as e:
+            logger.error(f"Model not ready: {e}")
+            return jsonify({"error": "Classification service unavailable"}), 503
+    
+    except Exception as e:
+        logger.error(f"Classification error: {e}", exc_info=True)
+        return jsonify({"error": "Failed to process image"}), 500
+
+@app.route("/api/classify/test", methods=["POST", "GET"])
+def test_classify():
+    """Test classification endpoint with mock prediction or sample image."""
+    try:
+        if request.method == "POST" and "image" in request.files:
+            file = request.files["image"]
+            try:
+                validate_uploaded_file(file)
+                filename = secure_filename(file.filename)
+                image_bytes = file.read()
+                result = waste_classifier.classify(image_bytes, filename=filename, augment=True)
+                result["test_mode"] = True
+                return jsonify(result), 200
+            except ValueError as e:
+                return jsonify({"error": str(e)}), 400
+            except (InvalidImageError, LowConfidenceError) as e:
+                return jsonify({"error": str(e)}), 400
+            except ModelNotReadyError as e:
+                return jsonify({"error": str(e)}), 503
+        
+        result = waste_classifier.generate_mock_result()
+        result["test_mode"] = True
+        result["note"] = "Mock classification result for testing"
+        return jsonify(result), 200
+    
+    except Exception as e:
+        logger.error(f"Test classification error: {e}", exc_info=True)
+        return jsonify({"error": "Test endpoint failed"}), 500
+
+@app.route("/api/classify/status", methods=["GET"])
+def classifier_status():
+    """Get classifier service status."""
+    return jsonify({
+        "status": "ready" if waste_classifier.is_ready() else "not_ready",
+        "model_loaded_at": waste_classifier.model_loaded_at.isoformat() if waste_classifier.model_loaded_at else None,
+        "mock_mode": waste_classifier.uses_mock,
+        "confidence_threshold": CONFIDENCE_THRESHOLD,
+        "categories": waste_classifier.categories,
+        "max_file_size_mb": MAX_FILE_SIZE / (1024 * 1024),
+        "allowed_formats": sorted(ALLOWED_IMAGE_EXTENSIONS)
+    }), 200
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=5000)
